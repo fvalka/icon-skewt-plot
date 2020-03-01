@@ -169,7 +169,7 @@ def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
 
     top_idx = find_closest_model_level(sounding.p * units.Pa, top * units("hPa"))
 
-    fig = plt.figure(figsize=(11, 11))
+    fig = plt.figure(figsize=(11, 11), constrained_layout=True)
     skew = SkewT(fig, rotation=skew)
 
     skew.plot(sounding.p * units.Pa, sounding.T * units.K, 'r')
@@ -235,8 +235,7 @@ def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
 def main():
     latitude = 48.2082
     longitude = 16.3738
-    timestep = 4
-    valid_at = datetime.datetime.utcnow().replace(tzinfo=pytz.utc) + datetime.timedelta(hours=timestep)
+    valid_at = b = datetime.datetime(2020, 3, 1, 11).replace(tzinfo=pytz.utc)
     sounding = load_weather_model_sounding(latitude, longitude, valid_at)
 
     large_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based")
