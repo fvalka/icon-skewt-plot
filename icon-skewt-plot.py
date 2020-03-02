@@ -1,5 +1,6 @@
 import bz2
 import datetime
+import json
 import logging
 import os
 import os.path
@@ -14,14 +15,25 @@ import requests
 import xarray as xr
 from metpy.plots import SkewT
 from metpy.units import units
+from flask import Flask, make_response
+from flask_json import FlaskJSON, JsonError, json_response, as_json, request
 
 import config
+
+app = Flask(__name__)
+FlaskJSON(app)
 
 logging.basicConfig(level=logging.DEBUG)
 
 
-class WeatherModelSounding():
-    def __init__(self, latitude, longitude, p, T, QV, Td, U, V, HHL, lowest_P_level):
+class WeatherModelSoundingMetaData:
+    def __init__(self, model_time, valid_time):
+        self.model_time = model_time
+        self.valid_time = valid_time
+
+
+class WeatherModelSounding:
+    def __init__(self, latitude, longitude, p, T, QV, Td, U, V, HHL, metadata):
         self.latitude = latitude
         self.longitude = longitude
         self.p = p
@@ -31,14 +43,50 @@ class WeatherModelSounding():
         self.U = U
         self.V = V
         self.HHL = HHL
-        self.lowest_P_level = lowest_P_level
+        self.metadata = metadata
+
+        latitude_pretty = str(abs(round(latitude, 2)))
+        if latitude < 0:
+            latitude_pretty = latitude_pretty + "S"
+        else:
+            latitude_pretty = latitude_pretty + "N"
+
+        longitude_pretty = str(abs(round(longitude, 2)))
+        if longitude > 0:
+            longitude_pretty = longitude_pretty + "E"
+        else:
+            longitude_pretty = longitude_pretty + "W"
+
+        self.latitude_pretty = latitude_pretty
+        self.longitude_pretty = longitude_pretty
+
+
+class SkewTResult:
+    def __init__(self, model_time, valid_time, plot_full, plot_detail):
+        self.model_time = model_time
+        self.valid_time = valid_time
+        self.plot_full = plot_full
+        self.plot_detail = plot_detail
+
+    def __json__(self):
+        return {
+            "model_time": self.model_time,
+            "valid_time": self.valid_time,
+            "plot_full": self.plot_full,
+            "plot_detail": self.plot_detail
+        }
 
 
 def download_bz2(url, target_file):
     r = requests.get(url)
+    r.raise_for_status()
+
+    decompressor = bz2.BZ2Decompressor()
 
     with open(target_file, 'wb') as f:
-        f.write(bz2.decompress(r.content))
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(decompressor.decompress(chunk))
 
 
 def download_content():
@@ -75,18 +123,10 @@ def latest_run(model, valid_time):
     return result
 
 
-def load_level(model, run, parameter, level, level_type="model_level"):
+def load_level(model, run_hour, run_datetime, timestep, parameter, level, level_type="model_level"):
     """
     Load grib files for a single level from the local disk or from the OpenData server
     """
-
-    if run is None:
-        return None
-
-    run_hour = run[0]
-    run_datetime = run[1]
-    timestep = int(run[2])
-
     if level_type == "model_level":
         path = f"./{model}" \
                f"/grib" \
@@ -111,16 +151,15 @@ def load_level(model, run, parameter, level, level_type="model_level"):
     return xr.open_dataset(path, engine='cfgrib')
 
 
-def interp_parameter_for_level(latitude, longitude, model, run, timestep, parameter, level):
-    level_grib = load_level(model, run, timestep, parameter, level)
-    return level_grib.to_array()[0].interp(latitude=latitude, longitude=longitude).values
-
-
 def parameter_all_levels(model, run, parameter, latitude, longitude, level_type="model_level"):
     result = np.empty(0)
 
+    run_hour = run[0]
+    run_datetime = run[1]
+    timestep = int(run[2])
+
     for level in range(60, 0, -1):
-        level_grib = load_level(model, run, parameter, level, level_type)
+        level_grib = load_level(model, run_hour, run_datetime, timestep, parameter, level, level_type)
 
         result = np.append(result, level_grib.to_array()[0].interp(latitude=latitude, longitude=longitude).values)
 
@@ -158,14 +197,18 @@ def load_weather_model_sounding(latitude, longitude, valid_time):
     # Height above MSL for model level
     HHL = parameter_all_levels(model, run, "hhl", latitude, longitude, "time_invariant")
 
-    lowest_P_level = load_level(model, run, "P", 60)
+    lowest_P_level = load_level(model, run[0], run[1], int(run[2]), "P", 60)
 
-    return WeatherModelSounding(latitude, longitude, p, T, QV, Td, U, V, HHL, lowest_P_level)
+    model_time = lowest_P_level.time.values
+    valid_time = lowest_P_level.valid_time.values
+    meta_data = WeatherModelSoundingMetaData(model_time, valid_time)
+
+    return WeatherModelSounding(latitude, longitude, p, T, QV, Td, U, V, HHL, meta_data)
 
 
 def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
-    model_time = np.datetime_as_string(sounding.lowest_P_level.time.values, unit='m')
-    valid_time = np.datetime_as_string(sounding.lowest_P_level.valid_time.values, unit='m')
+    model_time = np.datetime_as_string(sounding.metadata.model_time, unit='m')
+    valid_time = np.datetime_as_string(sounding.metadata.valid_time, unit='m')
 
     top_idx = find_closest_model_level(sounding.p * units.Pa, top * units("hPa"))
 
@@ -193,19 +236,7 @@ def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
     plt.xlabel("Temperature [°C]")
     plt.ylabel("Pressure [hPa]")
 
-    latitude_pretty = str(abs(round(sounding.latitude, 2)))
-    if sounding.latitude < 0:
-        latitude_pretty = latitude_pretty + "S"
-    else:
-        latitude_pretty = latitude_pretty + "N"
-
-    longitude_pretty = str(abs(round(sounding.longitude, 2)))
-    if sounding.longitude > 0:
-        longitude_pretty = longitude_pretty + "E"
-    else:
-        longitude_pretty = longitude_pretty + "W"
-
-    fig.suptitle(f"ICON-EU Model for {latitude_pretty}, {longitude_pretty}", fontsize=14)
+    fig.suptitle(f"ICON-EU Model for {sounding.latitude_pretty}, {sounding.longitude_pretty}", fontsize=14)
 
     ax1 = plt.gca()
     ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
@@ -235,12 +266,46 @@ def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
 def main():
     latitude = 48.2082
     longitude = 16.3738
-    valid_at = b = datetime.datetime(2020, 3, 1, 11).replace(tzinfo=pytz.utc)
+    valid_at = b = datetime.datetime(2020, 3, 2, 11).replace(tzinfo=pytz.utc)
     sounding = load_weather_model_sounding(latitude, longitude, valid_at)
 
     large_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based")
     large_plot.savefig('full_skewt.png')
 
 
+@app.route("/<float:latitude>/<float:longitude>/<int:run_hour>/<int:run_datetime>/<int:timestep>/<parameter>/<level>")
+def nwp_value(latitude, longitude, run_hour, run_datetime, timestep, parameter, level):
+    level_type = request.args.get("level_type", "model_level")
+    level_grib = load_level(config.model, run_hour, run_datetime, timestep, parameter, level, level_type)
+    return level_grib.to_array()[0].interp(latitude=latitude, longitude=longitude).values[0]
+
+
+@app.route("/<float:latitude>/<float:longitude>/<valid_at>")
+def skewt(latitude, longitude, valid_at):
+    valid_at_parsed = datetime.datetime.strptime(valid_at, "%Y%m%d%H")
+    valid_at_parsed = pytz.timezone('UTC').localize(valid_at_parsed)
+
+    sounding = load_weather_model_sounding(latitude, longitude, valid_at_parsed)
+    model_time = str(np.datetime_as_string(sounding.metadata.model_time, unit='m'))
+    valid_time = str(np.datetime_as_string(sounding.metadata.valid_time, unit='m'))
+    model_time_for_file_name = model_time.replace(":", "_")
+    valid_time_for_file_name = valid_time.replace(":", "_")
+
+    full_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based")
+    full_plot_filename = f"plot_{sounding.latitude_pretty}_{sounding.longitude_pretty}_" \
+                         f"{model_time_for_file_name}_{valid_time_for_file_name}_full.png"
+    full_plot.savefig(full_plot_filename)
+
+    detail_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based", base=1000, top=500, skew=15)
+    detail_plot_filename = f"plot_{sounding.latitude_pretty}_{sounding.longitude_pretty}_" \
+                           f"{model_time_for_file_name}_{valid_time_for_file_name}_detail.png"
+    detail_plot.savefig(detail_plot_filename)
+
+    result = json.dumps(SkewTResult(model_time, valid_time, full_plot_filename, detail_plot_filename).__dict__)
+    response = make_response(result)
+    response.mimetype = 'application/json'
+    return response
+
+
 if __name__ == "__main__":
-    main()
+    app.run()
