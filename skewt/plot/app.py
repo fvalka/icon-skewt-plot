@@ -8,6 +8,7 @@ import os.path
 import re
 from concurrent.futures._base import ALL_COMPLETED
 from pathlib import Path
+from google.cloud import storage
 
 import matplotlib.pyplot as plt
 import metpy.calc as mpcalc
@@ -309,7 +310,17 @@ def skewt(latitude, longitude, valid_at):
                            f"{model_time_for_file_name}_{valid_time_for_file_name}_detail.png"
     detail_plot.savefig(detail_plot_filename)
 
-    result = json.dumps(SkewTResult(model_time, valid_time, full_plot_filename, detail_plot_filename).__dict__)
+    # Google Cloud Upload
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(config.bucket_name)
+    blob_full = bucket.blob(full_plot_filename)
+    blob_full.upload_from_filename(full_plot_filename)
+    blob_detail = bucket.blob(detail_plot_filename)
+    blob_detail.upload_from_filename(detail_plot_filename)
+
+    result = json.dumps(SkewTResult(model_time, valid_time,
+                                    config.bucket_public_url + full_plot_filename,
+                                    config.bucket_public_url + detail_plot_filename).__dict__)
     response = make_response(result)
     response.mimetype = 'application/json'
     return response
