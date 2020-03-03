@@ -14,18 +14,20 @@ import metpy.calc as mpcalc
 import numpy as np
 import pytz
 import requests
+import requests.sessions
 import xarray as xr
 from metpy.plots import SkewT
 from metpy.units import units
 from flask import Flask, make_response
 from flask_json import FlaskJSON, JsonError, json_response, as_json, request
 
-import config
+import skewt.plot.config as config
 
 app = Flask(__name__)
 FlaskJSON(app)
 
-logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+logging.basicConfig(format='%(asctime)s %(message)s', level=logging.DEBUG)
 
 
 class WeatherModelSoundingMetaData:
@@ -79,8 +81,8 @@ class SkewTResult:
         }
 
 
-def download_bz2(url, target_file):
-    r = requests.get(url)
+def download_bz2(url, target_file, session=requests.sessions.Session()):
+    r = session.get(url)
     r.raise_for_status()
 
     decompressor = bz2.BZ2Decompressor()
@@ -125,30 +127,20 @@ def latest_run(model, valid_time):
     return result
 
 
-def download_level(model, run, parameter, level, level_type="model_level"):
+def download_file(path, session=requests.sessions.Session()):
     """
     Load grib files for a single level from the local disk or from the OpenData server
     """
-
-    if run is None:
-        return None
-
-    run_hour = run[0]
-    run_datetime = run[1]
-    timestep = int(run[2])
-
-    path = level_path(model, run_hour, run_datetime, timestep, parameter, level_type, level)
-
     if not os.path.isfile(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         download_url = config.dwd_base_url + path[2:] + ".bz2"
-        print("Download file from: " + download_url)
-        download_bz2(download_url, path)
+        logging.info("Download file from: " + download_url)
+        download_bz2(download_url, path, session)
 
     return path
 
 
-def level_path(model, run_hour, run_datetime, timestep, parameter, level_type, level):
+def level_path(model, run_hour, run_datetime, timestep, parameter, level, level_type):
     if level_type == "model_level":
         path = f"./{model}" \
                f"/grib" \
@@ -166,17 +158,26 @@ def level_path(model, run_hour, run_datetime, timestep, parameter, level_type, l
     return path
 
 
+class AllLevelData:
+    def __init__(self, data, model_time, valid_time):
+        self.data = data
+        self.model_time = model_time
+        self.valid_time = valid_time
+
+
 def parameter_all_levels(model, run, parameter, latitude, longitude, level_type="model_level"):
     levels = list(range(60, 0, -1))
+    paths = [level_path(model, run[0], run[1], int(run[2]), parameter, level, level_type) for level in levels]
 
+    session = requests.sessions.Session()
     with concurrent.futures.ThreadPoolExecutor(max_workers=config.http_download_pool) as executor:
-        futures = list(executor.submit(download_level(model, run, parameter, level, level_type)) for level in levels)
+        futures = list(executor.submit(download_file(path, session)) for path in paths)
         concurrent.futures.wait(futures, timeout=None, return_when=ALL_COMPLETED)
 
-    path_all_levels = level_path(model, run[0], run[1], int(run[2]), parameter, level_type, "*")
-
-    data_set = xr.open_mfdataset(path_all_levels, engine="cfgrib", concat_dim="generalVerticalLayer", combine='nested', parallel=False)
-    return data_set.to_array()[0].interp(latitude=latitude, longitude=longitude).values
+    data_set = xr.open_mfdataset(paths, engine="cfgrib", concat_dim="generalVerticalLayer",
+                                 combine='nested', parallel=config.cfgrib_parallel)
+    interpolated = data_set.to_array()[0].interp(latitude=latitude, longitude=longitude)
+    return AllLevelData(interpolated.values, interpolated.time.values, interpolated.valid_time.values)
 
 
 def find_closest_model_level(p, needle):
@@ -192,29 +193,26 @@ def load_weather_model_sounding(latitude, longitude, valid_time):
     run = latest_run(model, valid_time)
 
     # Pressure Pa
-    p = parameter_all_levels(model, run, "p", latitude, longitude)
+    p_raw = parameter_all_levels(model, run, "p", latitude, longitude)
+    p = p_raw.data
 
     # Temperature K
-    T = parameter_all_levels(model, run, "T", latitude, longitude)
+    T = parameter_all_levels(model, run, "T", latitude, longitude).data
 
     # Specific Humidty kg/kg
-    QV = parameter_all_levels(model, run, "QV", latitude, longitude)
+    QV = parameter_all_levels(model, run, "QV", latitude, longitude).data
 
     # Dewpoint K
     Td = mpcalc.dewpoint_from_specific_humidity(QV * units("kg/kg"), T * units.K, p * units.Pa)
 
     # Wind m/s
-    U = parameter_all_levels(model, run, "u", latitude, longitude)
-    V = parameter_all_levels(model, run, "v", latitude, longitude)
+    U = parameter_all_levels(model, run, "u", latitude, longitude).data
+    V = parameter_all_levels(model, run, "v", latitude, longitude).data
 
     # Height above MSL for model level
-    HHL = parameter_all_levels(model, run, "hhl", latitude, longitude, "time_invariant")
+    HHL = parameter_all_levels(model, run, "hhl", latitude, longitude, "time_invariant").data
 
-    lowest_P_level = download_level(model, run, "P", 60)
-
-    model_time = lowest_P_level.time.values
-    valid_time = lowest_P_level.valid_time.values
-    meta_data = WeatherModelSoundingMetaData(model_time, valid_time)
+    meta_data = WeatherModelSoundingMetaData(p_raw.model_time, p_raw.valid_time)
 
     return WeatherModelSounding(latitude, longitude, p, T, QV, Td, U, V, HHL, meta_data)
 
@@ -279,22 +277,11 @@ def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
 def main():
     latitude = 48.2082
     longitude = 16.3738
-    valid_at = b = datetime.datetime(2020, 3, 3, 11).replace(tzinfo=pytz.utc)
+    valid_at = b = datetime.datetime(2020, 3, 3, 12).replace(tzinfo=pytz.utc)
     sounding = load_weather_model_sounding(latitude, longitude, valid_at)
 
     large_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based")
     large_plot.savefig('full_skewt.png')
-
-
-@app.route("/<float:latitude>/<float:longitude>/<int:run_hour>/<int:run_datetime>/<int:timestep>/<parameter>/<level>")
-def nwp_value(latitude, longitude, run_hour, run_datetime, timestep, parameter, level):
-    level_type = request.args.get("level_type", "model_level")
-    level_grib = load_level(config.model, int(run_hour), int(run_datetime), int(timestep), parameter, int(level),
-                            level_type)
-    result = str(level_grib.to_array()[0].interp(latitude=float(latitude), longitude=float(longitude)).values)
-    response = make_response(result, 200)
-    response.mimetype = "text/plain"
-    return response
 
 
 @app.route("/<float:latitude>/<float:longitude>/<valid_at>")
