@@ -1,9 +1,11 @@
 import bz2
+import concurrent
 import datetime
 import logging
 import os
 import os.path
 import re
+from concurrent.futures._base import ALL_COMPLETED
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -39,6 +41,7 @@ def download_bz2(url, target_file):
 
     with open(target_file, 'wb') as f:
         f.write(bz2.decompress(r.content))
+        f.flush()
 
 
 def download_content():
@@ -75,7 +78,7 @@ def latest_run(model, valid_time):
     return result
 
 
-def load_level(model, run, parameter, level, level_type="model_level"):
+def download_level(model, run, parameter, level, level_type="model_level"):
     """
     Load grib files for a single level from the local disk or from the OpenData server
     """
@@ -87,20 +90,7 @@ def load_level(model, run, parameter, level, level_type="model_level"):
     run_datetime = run[1]
     timestep = int(run[2])
 
-    if level_type == "model_level":
-        path = f"./{model}" \
-               f"/grib" \
-               f"/{run_hour}" \
-               f"/{parameter.lower()}" \
-               f"/icon-eu_europe_regular-lat-lon_model-level_{run_datetime}_{timestep:03d}_{level:d}_{parameter.upper()}.grib2"
-    elif level_type == "time_invariant":
-        path = f"./{model}" \
-               f"/grib" \
-               f"/{run_hour}" \
-               f"/{parameter.lower()}" \
-               f"/icon-eu_europe_regular-lat-lon_time-invariant_{run_datetime}_{level:d}_{parameter.upper()}.grib2"
-    else:
-        raise AttributeError("Invalid level type")
+    path = level_path(model, run_hour, run_datetime, timestep, parameter, level_type, level)
 
     if not os.path.isfile(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -108,23 +98,38 @@ def load_level(model, run, parameter, level, level_type="model_level"):
         print("Download file from: " + download_url)
         download_bz2(download_url, path)
 
-    return xr.open_dataset(path, engine='cfgrib')
+    return path
 
 
-def interp_parameter_for_level(latitude, longitude, model, run, timestep, parameter, level):
-    level_grib = load_level(model, run, timestep, parameter, level)
-    return level_grib.to_array()[0].interp(latitude=latitude, longitude=longitude).values
+def level_path(model, run_hour, run_datetime, timestep, parameter, level_type, level):
+    if level_type == "model_level":
+        path = f"./{model}" \
+               f"/grib" \
+               f"/{run_hour}" \
+               f"/{parameter.lower()}" \
+               f"/icon-eu_europe_regular-lat-lon_model-level_{run_datetime}_{timestep:03d}_{level}_{parameter.upper()}.grib2"
+    elif level_type == "time_invariant":
+        path = f"./{model}" \
+               f"/grib" \
+               f"/{run_hour}" \
+               f"/{parameter.lower()}" \
+               f"/icon-eu_europe_regular-lat-lon_time-invariant_{run_datetime}_{level}_{parameter.upper()}.grib2"
+    else:
+        raise AttributeError("Invalid level type")
+    return path
 
 
 def parameter_all_levels(model, run, parameter, latitude, longitude, level_type="model_level"):
-    result = np.empty(0)
+    levels = list(range(60, 0, -1))
 
-    for level in range(60, 0, -1):
-        level_grib = load_level(model, run, parameter, level, level_type)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=config.http_download_pool) as executor:
+        futures = list(executor.submit(download_level(model, run, parameter, level, level_type)) for level in levels)
+        concurrent.futures.wait(futures, timeout=None, return_when=ALL_COMPLETED)
 
-        result = np.append(result, level_grib.to_array()[0].interp(latitude=latitude, longitude=longitude).values)
+    path_all_levels = level_path(model, run[0], run[1], int(run[2]), parameter, level_type, "*")
 
-    return result
+    data_set = xr.open_mfdataset(path_all_levels, engine="cfgrib", concat_dim="generalVerticalLayer", combine='nested', parallel=False)
+    return data_set.to_array()[0].interp(latitude=latitude, longitude=longitude).values
 
 
 def find_closest_model_level(p, needle):
@@ -158,7 +163,7 @@ def load_weather_model_sounding(latitude, longitude, valid_time):
     # Height above MSL for model level
     HHL = parameter_all_levels(model, run, "hhl", latitude, longitude, "time_invariant")
 
-    lowest_P_level = load_level(model, run, "P", 60)
+    lowest_P_level = download_level(model, run, "P", 60)
 
     return WeatherModelSounding(latitude, longitude, p, T, QV, Td, U, V, HHL, lowest_P_level)
 
@@ -235,7 +240,7 @@ def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
 def main():
     latitude = 48.2082
     longitude = 16.3738
-    valid_at = b = datetime.datetime(2020, 3, 1, 11).replace(tzinfo=pytz.utc)
+    valid_at = b = datetime.datetime(2020, 3, 3, 11).replace(tzinfo=pytz.utc)
     sounding = load_weather_model_sounding(latitude, longitude, valid_at)
 
     large_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based")
