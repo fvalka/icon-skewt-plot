@@ -1,4 +1,5 @@
 import bz2
+import concurrent
 import datetime
 import json
 import logging
@@ -151,19 +152,31 @@ def load_level(model, run_hour, run_datetime, timestep, parameter, level, level_
     return xr.open_dataset(path, engine='cfgrib')
 
 
+def get_float_http(url):
+    r = requests.get(url)
+    r.raise_for_status()
+    return float(r.content)
+
+
 def parameter_all_levels(model, run, parameter, latitude, longitude, level_type="model_level"):
-    result = np.empty(0)
+    result = list()
 
     run_hour = run[0]
     run_datetime = run[1]
     timestep = int(run[2])
 
-    for level in range(60, 0, -1):
-        level_grib = load_level(model, run_hour, run_datetime, timestep, parameter, level, level_type)
+    base_url = f"{config.single_parameter_url}/" \
+               f"{latitude}/" \
+               f"{longitude}/" \
+               f"{run_hour}/" \
+               f"{run_datetime}/" \
+               f"{timestep}/" \
+               f"{parameter}"
 
-        result = np.append(result, level_grib.to_array()[0].interp(latitude=latitude, longitude=longitude).values)
-
-    return result
+    with concurrent.futures.ThreadPoolExecutor(max_workers=config.concurrent_connections) as executor:
+        levels = range(60, 0, -1)
+        all_levels_result = executor.map(lambda l: get_float_http(f"{base_url}/{l}?level_type={level_type}"), levels)
+        return np.array(list(all_levels_result))
 
 
 def find_closest_model_level(p, needle):
@@ -276,8 +289,12 @@ def main():
 @app.route("/<float:latitude>/<float:longitude>/<int:run_hour>/<int:run_datetime>/<int:timestep>/<parameter>/<level>")
 def nwp_value(latitude, longitude, run_hour, run_datetime, timestep, parameter, level):
     level_type = request.args.get("level_type", "model_level")
-    level_grib = load_level(config.model, run_hour, run_datetime, timestep, parameter, level, level_type)
-    return level_grib.to_array()[0].interp(latitude=latitude, longitude=longitude).values[0]
+    level_grib = load_level(config.model, int(run_hour), int(run_datetime), int(timestep), parameter, int(level),
+                            level_type)
+    result = str(level_grib.to_array()[0].interp(latitude=float(latitude), longitude=float(longitude)).values)
+    response = make_response(result, 200)
+    response.mimetype = "text/plain"
+    return response
 
 
 @app.route("/<float:latitude>/<float:longitude>/<valid_at>")
@@ -286,10 +303,12 @@ def skewt(latitude, longitude, valid_at):
     valid_at_parsed = pytz.timezone('UTC').localize(valid_at_parsed)
 
     sounding = load_weather_model_sounding(latitude, longitude, valid_at_parsed)
-    model_time = str(np.datetime_as_string(sounding.metadata.model_time, unit='m'))
-    valid_time = str(np.datetime_as_string(sounding.metadata.valid_time, unit='m'))
-    model_time_for_file_name = model_time.replace(":", "_")
-    valid_time_for_file_name = valid_time.replace(":", "_")
+
+    model_time = str(np.datetime_as_string(sounding.metadata.model_time))
+    valid_time = str(np.datetime_as_string(sounding.metadata.valid_time))
+
+    model_time_for_file_name = str(np.datetime_as_string(sounding.metadata.model_time, unit='m')).replace(":", "_")
+    valid_time_for_file_name = str(np.datetime_as_string(sounding.metadata.valid_time, unit='m')).replace(":", "_")
 
     full_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based")
     full_plot_filename = f"plot_{sounding.latitude_pretty}_{sounding.longitude_pretty}_" \
