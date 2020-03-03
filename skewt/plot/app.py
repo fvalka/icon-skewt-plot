@@ -177,7 +177,9 @@ def parameter_all_levels(model, run, parameter, latitude, longitude, level_type=
     data_set = xr.open_mfdataset(paths, engine="cfgrib", concat_dim="generalVerticalLayer",
                                  combine='nested', parallel=config.cfgrib_parallel)
     interpolated = data_set.to_array()[0].interp(latitude=latitude, longitude=longitude)
-    return AllLevelData(interpolated.values, interpolated.time.values, interpolated.valid_time.values)
+    data = AllLevelData(interpolated.values, interpolated.time.values, interpolated.valid_time.values)
+    data_set.close()
+    return data
 
 
 def find_closest_model_level(p, needle):
