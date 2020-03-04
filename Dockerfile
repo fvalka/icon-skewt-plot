@@ -1,8 +1,5 @@
 FROM python:3.7-buster
 
-# System dependencies
-RUN apt-get update && apt-get install -y libeccodes0
-
 ENV APP_HOME /app
 WORKDIR $APP_HOME
 

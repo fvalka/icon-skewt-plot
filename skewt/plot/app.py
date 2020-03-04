@@ -1,14 +1,10 @@
 import bz2
-import concurrent
 import datetime
 import json
 import logging
-import os
-import os.path
 import re
-from concurrent.futures._base import ALL_COMPLETED
+from concurrent.futures.thread import ThreadPoolExecutor
 from pathlib import Path
-from google.cloud import storage
 
 import matplotlib.pyplot as plt
 import metpy.calc as mpcalc
@@ -16,11 +12,11 @@ import numpy as np
 import pytz
 import requests
 import requests.sessions
-import xarray as xr
+from flask import Flask, make_response
+from flask_json import FlaskJSON
+from google.cloud import storage
 from metpy.plots import SkewT
 from metpy.units import units
-from flask import Flask, make_response
-from flask_json import FlaskJSON, JsonError, json_response, as_json, request
 
 import skewt.plot.config as config
 
@@ -128,37 +124,6 @@ def latest_run(model, valid_time):
     return result
 
 
-def download_file(path, session=requests.sessions.Session()):
-    """
-    Load grib files for a single level from the local disk or from the OpenData server
-    """
-    if not os.path.isfile(path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        download_url = config.dwd_base_url + path[2:] + ".bz2"
-        logging.info("Download file from: " + download_url)
-        download_bz2(download_url, path, session)
-
-    return path
-
-
-def level_path(model, run_hour, run_datetime, timestep, parameter, level, level_type):
-    if level_type == "model_level":
-        path = f"./{model}" \
-               f"/grib" \
-               f"/{run_hour}" \
-               f"/{parameter.lower()}" \
-               f"/icon-eu_europe_regular-lat-lon_model-level_{run_datetime}_{timestep:03d}_{level}_{parameter.upper()}.grib2"
-    elif level_type == "time_invariant":
-        path = f"./{model}" \
-               f"/grib" \
-               f"/{run_hour}" \
-               f"/{parameter.lower()}" \
-               f"/icon-eu_europe_regular-lat-lon_time-invariant_{run_datetime}_{level}_{parameter.upper()}.grib2"
-    else:
-        raise AttributeError("Invalid level type")
-    return path
-
-
 class AllLevelData:
     def __init__(self, data, model_time, valid_time):
         self.data = data
@@ -166,21 +131,49 @@ class AllLevelData:
         self.valid_time = valid_time
 
 
-def parameter_all_levels(model, run, parameter, latitude, longitude, level_type="model_level"):
-    levels = list(range(60, 0, -1))
-    paths = [level_path(model, run[0], run[1], int(run[2]), parameter, level, level_type) for level in levels]
+def parameter_all_levels(model, run, parameter, latitude, longitude, level_type="model_level", session=requests.Session()):
+    run_hour = run[0]
+    run_datetime = run[1]
+    timestep = int(run[2])
+    logging.info(f"Loading sounding for latitude={latitude} longitude={longitude} with "
+                 f"run_hour={run_hour} run_datetime={run_datetime} timestep={timestep} "
+                 f"level_type={level_type} and parameter={parameter}")
 
-    session = requests.sessions.Session()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=config.http_download_pool) as executor:
-        futures = list(executor.submit(download_file(path, session)) for path in paths)
-        concurrent.futures.wait(futures, timeout=None, return_when=ALL_COMPLETED)
+    levels = np.floor(np.linspace(60, 0, config.level_workers)).astype(int).tolist()
+    urls = list()
 
-    data_set = xr.open_mfdataset(paths, engine="cfgrib", concat_dim="generalVerticalLayer",
-                                 combine='nested', parallel=config.cfgrib_parallel)
-    interpolated = data_set.to_array()[0].interp(latitude=latitude, longitude=longitude)
-    data = AllLevelData(interpolated.values, interpolated.time.values, interpolated.valid_time.values)
-    data_set.close()
-    return data
+    for i in range(0, len(levels) - 1):
+        base = levels[i]
+        top = levels[i + 1] + 1
+        # example URL:
+        # https://nwp-sounding-mw5zsrftba-ew.a.run.app/48.21/16.37/06/2020030406/4/p
+        url = f"{config.sounding_api}" \
+               f"/{latitude}" \
+               f"/{longitude}" \
+               f"/{run_hour}" \
+               f"/{run_datetime}" \
+               f"/{timestep}" \
+               f"/{parameter}" \
+               f"?level_type={level_type}" \
+               f"&base={base}" \
+               f"&top={top}"
+        urls.append(url)
+
+    result = AllLevelData(data=np.empty(0), model_time=None, valid_time=None)
+
+    with ThreadPoolExecutor(max_workers=config.level_workers) as executor:
+        responses = list(executor.map(session.get, urls))
+
+        for response in responses:
+            response.raise_for_status()
+            json_result = json.loads(response.content)
+            result.data = np.append(result.data, np.array(json_result["data"]))
+
+        json_first = json.loads(responses[0].content)
+        result.model_time = np.datetime64(json_result["model_time"])
+        result.valid_time = np.datetime64(json_result["valid_time"])
+
+    return result
 
 
 def find_closest_model_level(p, needle):
@@ -195,25 +188,38 @@ def load_weather_model_sounding(latitude, longitude, valid_time):
     model = "icon-eu"
     run = latest_run(model, valid_time)
 
+    http_session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=800, pool_maxsize=800)
+    http_session.mount('http://', adapter)
+    http_session.mount('https://', adapter)
+
+    with ThreadPoolExecutor(max_workers=config.parameter_all_levels_workers) as executor:
+        p_future = executor.submit(parameter_all_levels, model, run, "p", latitude, longitude, session=http_session)
+        T_future = executor.submit(parameter_all_levels, model, run, "T", latitude, longitude, session=http_session)
+        QV_future = executor.submit(parameter_all_levels, model, run, "QV", latitude, longitude, session=http_session)
+        U_future = executor.submit(parameter_all_levels, model, run, "U", latitude, longitude, session=http_session)
+        V_future = executor.submit(parameter_all_levels, model, run, "V", latitude, longitude, session=http_session)
+        HHL_future = executor.submit(parameter_all_levels, model, run, "HHL", latitude, longitude, "time_invariant", session=http_session)
+
     # Pressure Pa
-    p_raw = parameter_all_levels(model, run, "p", latitude, longitude)
+    p_raw = p_future.result()
     p = p_raw.data
 
     # Temperature K
-    T = parameter_all_levels(model, run, "T", latitude, longitude).data
+    T = T_future.result().data
 
     # Specific Humidty kg/kg
-    QV = parameter_all_levels(model, run, "QV", latitude, longitude).data
+    QV = QV_future.result().data
 
     # Dewpoint K
     Td = mpcalc.dewpoint_from_specific_humidity(QV * units("kg/kg"), T * units.K, p * units.Pa)
 
     # Wind m/s
-    U = parameter_all_levels(model, run, "u", latitude, longitude).data
-    V = parameter_all_levels(model, run, "v", latitude, longitude).data
+    U = U_future.result().data
+    V = V_future.result().data
 
     # Height above MSL for model level
-    HHL = parameter_all_levels(model, run, "hhl", latitude, longitude, "time_invariant").data
+    HHL = HHL_future.result().data
 
     meta_data = WeatherModelSoundingMetaData(p_raw.model_time, p_raw.valid_time)
 
@@ -277,16 +283,6 @@ def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
     return fig
 
 
-def main():
-    latitude = 48.2082
-    longitude = 16.3738
-    valid_at = b = datetime.datetime(2020, 3, 3, 12).replace(tzinfo=pytz.utc)
-    sounding = load_weather_model_sounding(latitude, longitude, valid_at)
-
-    large_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based")
-    large_plot.savefig('full_skewt.png')
-
-
 @app.route("/<float:latitude>/<float:longitude>/<valid_at>")
 def skewt(latitude, longitude, valid_at):
     valid_at_parsed = datetime.datetime.strptime(valid_at, "%Y%m%d%H")
@@ -311,12 +307,15 @@ def skewt(latitude, longitude, valid_at):
     detail_plot.savefig(detail_plot_filename)
 
     # Google Cloud Upload
+
     storage_client = storage.Client()
     bucket = storage_client.bucket(config.bucket_name)
     blob_full = bucket.blob(full_plot_filename)
-    blob_full.upload_from_filename(full_plot_filename)
     blob_detail = bucket.blob(detail_plot_filename)
-    blob_detail.upload_from_filename(detail_plot_filename)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        executor.submit(blob_full.upload_from_filename, full_plot_filename)
+        executor.submit(blob_detail.upload_from_filename, detail_plot_filename)
 
     result = json.dumps(SkewTResult(model_time, valid_time,
                                     config.bucket_public_url + full_plot_filename,
