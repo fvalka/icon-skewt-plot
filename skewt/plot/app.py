@@ -17,6 +17,7 @@ from flask_json import FlaskJSON
 from google.cloud import storage
 from metpy.plots import SkewT
 from metpy.units import units
+from urllib3 import Retry
 
 import skewt.plot.config as config
 
@@ -188,10 +189,7 @@ def load_weather_model_sounding(latitude, longitude, valid_time):
     model = "icon-eu"
     run = latest_run(model, valid_time)
 
-    http_session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=800, pool_maxsize=800)
-    http_session.mount('http://', adapter)
-    http_session.mount('https://', adapter)
+    http_session = session()
 
     with ThreadPoolExecutor(max_workers=config.parameter_all_levels_workers) as executor:
         p_future = executor.submit(parameter_all_levels, model, run, "p", latitude, longitude, session=http_session)
@@ -224,6 +222,19 @@ def load_weather_model_sounding(latitude, longitude, valid_time):
     meta_data = WeatherModelSoundingMetaData(p_raw.model_time, p_raw.valid_time)
 
     return WeatherModelSounding(latitude, longitude, p, T, QV, Td, U, V, HHL, meta_data)
+
+
+def session():
+    http_session = requests.Session()
+    connection_pool_adapter = requests.adapters.HTTPAdapter(pool_connections=800, pool_maxsize=800)
+    http_session.mount('http://', connection_pool_adapter)
+    http_session.mount('https://', connection_pool_adapter)
+    retry_adapater = Retry(total=config.sounding_api_retries, read=config.sounding_api_retries,
+                           connect=config.sounding_api_retries,
+                           backoff_factor=0.3, status_forcelist=(500, 502, 504))
+    http_session.mount('http://', retry_adapater)
+    http_session.mount('https://', retry_adapater)
+    return http_session
 
 
 def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
