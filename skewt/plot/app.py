@@ -17,6 +17,7 @@ from flask_json import FlaskJSON
 from google.cloud import storage
 from metpy.plots import SkewT
 from metpy.units import units
+from requests.adapters import HTTPAdapter
 from urllib3 import Retry
 
 import skewt.plot.config as config
@@ -229,11 +230,12 @@ def session():
     connection_pool_adapter = requests.adapters.HTTPAdapter(pool_connections=800, pool_maxsize=800)
     http_session.mount('http://', connection_pool_adapter)
     http_session.mount('https://', connection_pool_adapter)
-    retry_adapater = Retry(total=config.sounding_api_retries, read=config.sounding_api_retries,
+    retry = Retry(total=config.sounding_api_retries, read=config.sounding_api_retries,
                            connect=config.sounding_api_retries,
                            backoff_factor=0.3, status_forcelist=(500, 502, 504))
-    http_session.mount('http://', retry_adapater)
-    http_session.mount('https://', retry_adapater)
+    retry_adapter = HTTPAdapter(max_retries=retry)
+    http_session.mount('http://', retry_adapter)
+    http_session.mount('https://', retry_adapter)
     return http_session
 
 
