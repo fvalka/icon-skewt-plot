@@ -131,6 +131,19 @@ Roland Stull provides a great explanation in his book
  explanation is given in the 
  [chapter on atmospheric stability](https://www.eoas.ubc.ca/books/Practical_Meteorology/prmet102/Ch05-stability-v102b.pdf) (page 122). 
 
+## Architecture and Deployment
+
+A second backend application is used for high concurrency. Both applications are deployed
+using a Docker container, built on Google Cloud Build. The container is then deployed 
+to Google Cloud Run.
+
+Resulting plots are stored in a Google Cloud Storage bucket, which has public access
+enabled, for serving the plots as a CDN. 
+
+<p align="center" style="margin-bottom: 10em;">
+  <img src="doc/deployment-diagram.png" alt="Example output" style="width: 70%"/>
+</p>
+
 ## Further Reading
 [ICON Database Reference Manual](https://www.dwd.de/SharedDocs/downloads/DE/modelldokumentationen/nwv/icon/icon_dbbeschr_aktuell.pdf?view=nasPublication&nn=13934)
 
