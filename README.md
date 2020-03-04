@@ -4,7 +4,9 @@ ICON-EU weather forecast model.
 
 An example of the output produced:
 
-![Example output](doc/full_example.png "Example output")
+<p align="center" style="margin-bottom: 10em;">
+  <img src="doc/full_example.png" alt="Example output" style="width: 70%"/>
+</p>
 
 ## API Usage
 Using the API is very easy and straightforward. An HTTP GET will start plotting the diagram, resulting in a simple
