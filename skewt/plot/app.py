@@ -232,7 +232,7 @@ def session():
     http_session.mount('https://', connection_pool_adapter)
     retry = Retry(total=config.sounding_api_retries, read=config.sounding_api_retries,
                            connect=config.sounding_api_retries,
-                           backoff_factor=0.3, status_forcelist=(500, 502, 504))
+                           backoff_factor=1.0, status_forcelist=(500, 502, 504))
     retry_adapter = HTTPAdapter(max_retries=retry)
     http_session.mount('http://', retry_adapter)
     http_session.mount('https://', retry_adapter)
