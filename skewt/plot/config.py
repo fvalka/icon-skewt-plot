@@ -10,4 +10,4 @@ bucket_name = "icon-skewt-plot"
 bucket_public_url = "https://storage.googleapis.com/icon-skewt-plot/"
 
 sounding_api = "https://nwp-sounding-mw5zsrftba-ew.a.run.app"
-sounding_api_retries = 5
+sounding_api_retries = 3

@@ -17,8 +17,12 @@ from flask_json import FlaskJSON
 from google.cloud import storage
 from metpy.plots import SkewT
 from metpy.units import units
+from opencensus.trace import config_integration
 from requests.adapters import HTTPAdapter
 from urllib3 import Retry
+from opencensus.ext.stackdriver import trace_exporter as stackdriver_exporter
+import opencensus.trace.tracer
+
 
 import skewt.plot.config as config
 
@@ -27,6 +31,15 @@ FlaskJSON(app)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format='%(asctime)s %(message)s', level=logging.DEBUG)
+
+# Metrics
+exporter = stackdriver_exporter.StackdriverExporter()
+tracer = opencensus.trace.tracer.Tracer(
+    exporter=exporter,
+    sampler=opencensus.trace.tracer.samplers.AlwaysOnSampler()
+)
+config_integration.trace_integrations(['requests'])
+
 
 
 class WeatherModelSoundingMetaData:
@@ -98,7 +111,8 @@ def download_content():
 
 
 def latest_run(model, valid_time):
-    download_content()
+    with tracer.span(name="download_content"):
+        download_content()
 
     pattern = re.compile("./%s" \
                          "/grib" \
@@ -109,19 +123,20 @@ def latest_run(model, valid_time):
     max_t: int = 0
     result = None
 
-    for i, line in enumerate(open('tmp/content.log')):
-        for match in re.finditer(pattern, line):
-            matches = match.groups()
+    with tracer.span(name="parse_content"):
+        for i, line in enumerate(open('tmp/content.log')):
+            for match in re.finditer(pattern, line):
+                matches = match.groups()
 
-            match_valid_at = datetime.datetime.strptime(matches[1], "%Y%m%d%H")
-            match_valid_at = pytz.timezone('UTC').localize(match_valid_at)
-            match_valid_at = match_valid_at + datetime.timedelta(hours=int(matches[2]))
+                match_valid_at = datetime.datetime.strptime(matches[1], "%Y%m%d%H")
+                match_valid_at = pytz.timezone('UTC').localize(match_valid_at)
+                match_valid_at = match_valid_at + datetime.timedelta(hours=int(matches[2]))
 
-            delta_t = abs((match_valid_at - valid_time).total_seconds())
+                delta_t = abs((match_valid_at - valid_time).total_seconds())
 
-            if delta_t <= 30 * 60 and int(matches[1]) > max_t:
-                result = matches
-                max_t = int(matches[1])
+                if delta_t <= 30 * 60 and int(matches[1]) > max_t:
+                    result = matches
+                    max_t = int(matches[1])
 
     return result
 
@@ -134,48 +149,53 @@ class AllLevelData:
 
 
 def parameter_all_levels(model, run, parameter, latitude, longitude, level_type="model_level", session=requests.Session()):
-    run_hour = run[0]
-    run_datetime = run[1]
-    timestep = int(run[2])
-    logging.info(f"Loading sounding for latitude={latitude} longitude={longitude} with "
-                 f"run_hour={run_hour} run_datetime={run_datetime} timestep={timestep} "
-                 f"level_type={level_type} and parameter={parameter}")
+    with tracer.span(name="load_parameters") as span:
+        run_hour = run[0]
+        run_datetime = run[1]
+        timestep = int(run[2])
+        logging.info(f"Loading sounding for latitude={latitude} longitude={longitude} with "
+                     f"run_hour={run_hour} run_datetime={run_datetime} timestep={timestep} "
+                     f"level_type={level_type} and parameter={parameter}")
+        span.add_attribute("parameter", parameter)
+        span.add_attribute("run_hour", str(run_hour))
+        span.add_attribute("run_datetime", str(run_datetime))
+        span.add_attribute("timestep", str(timestep))
 
-    levels = np.floor(np.linspace(60, 0, config.level_workers)).astype(int).tolist()
-    urls = list()
+        levels = np.floor(np.linspace(60, 0, config.level_workers)).astype(int).tolist()
+        urls = list()
 
-    for i in range(0, len(levels) - 1):
-        base = levels[i]
-        top = levels[i + 1] + 1
-        # example URL:
-        # https://nwp-sounding-mw5zsrftba-ew.a.run.app/48.21/16.37/06/2020030406/4/p
-        url = f"{config.sounding_api}" \
-               f"/{latitude}" \
-               f"/{longitude}" \
-               f"/{run_hour}" \
-               f"/{run_datetime}" \
-               f"/{timestep}" \
-               f"/{parameter}" \
-               f"?level_type={level_type}" \
-               f"&base={base}" \
-               f"&top={top}"
-        urls.append(url)
+        for i in range(0, len(levels) - 1):
+            base = levels[i]
+            top = levels[i + 1] + 1
+            # example URL:
+            # https://nwp-sounding-mw5zsrftba-ew.a.run.app/48.21/16.37/06/2020030406/4/p
+            url = f"{config.sounding_api}" \
+                   f"/{latitude}" \
+                   f"/{longitude}" \
+                   f"/{run_hour}" \
+                   f"/{run_datetime}" \
+                   f"/{timestep}" \
+                   f"/{parameter}" \
+                   f"?level_type={level_type}" \
+                   f"&base={base}" \
+                   f"&top={top}"
+            urls.append(url)
 
-    result = AllLevelData(data=np.empty(0), model_time=None, valid_time=None)
+        result = AllLevelData(data=np.empty(0), model_time=None, valid_time=None)
 
-    with ThreadPoolExecutor(max_workers=config.level_workers) as executor:
-        responses = list(executor.map(session.get, urls))
+        with ThreadPoolExecutor(max_workers=config.level_workers) as executor:
+            responses = list(executor.map(session.get, urls))
 
-        for response in responses:
-            response.raise_for_status()
-            json_result = json.loads(response.content)
-            result.data = np.append(result.data, np.array(json_result["data"]))
+            for response in responses:
+                response.raise_for_status()
+                json_result = json.loads(response.content)
+                result.data = np.append(result.data, np.array(json_result["data"]))
 
-        json_first = json.loads(responses[0].content)
-        result.model_time = np.datetime64(json_result["model_time"])
-        result.valid_time = np.datetime64(json_result["valid_time"])
+            json_first = json.loads(responses[0].content)
+            result.model_time = np.datetime64(json_result["model_time"])
+            result.valid_time = np.datetime64(json_result["valid_time"])
 
-    return result
+        return result
 
 
 def find_closest_model_level(p, needle):
@@ -187,8 +207,9 @@ def full_level_height(HHL, idx):
 
 
 def load_weather_model_sounding(latitude, longitude, valid_time):
-    model = "icon-eu"
-    run = latest_run(model, valid_time)
+    with tracer.span(name="latest_run"):
+        model = "icon-eu"
+        run = latest_run(model, valid_time)
 
     http_session = session()
 
@@ -227,15 +248,13 @@ def load_weather_model_sounding(latitude, longitude, valid_time):
 
 def session():
     http_session = requests.Session()
-    connection_pool_adapter = requests.adapters.HTTPAdapter(pool_connections=800, pool_maxsize=800)
-    http_session.mount('http://', connection_pool_adapter)
-    http_session.mount('https://', connection_pool_adapter)
     retry = Retry(total=config.sounding_api_retries, read=config.sounding_api_retries,
                            connect=config.sounding_api_retries,
-                           backoff_factor=1.0, status_forcelist=(500, 502, 504))
-    retry_adapter = HTTPAdapter(max_retries=retry)
-    http_session.mount('http://', retry_adapter)
-    http_session.mount('https://', retry_adapter)
+                           backoff_factor=1.5, status_forcelist=(429, 500, 502, 504),
+                           respect_retry_after_header=True)
+    http_adapter = HTTPAdapter(max_retries=retry, pool_connections=1000, pool_maxsize=1000)
+    http_session.mount('http://', http_adapter)
+    http_session.mount('https://', http_adapter)
     return http_session
 
 
@@ -298,44 +317,52 @@ def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
 
 @app.route("/<float:latitude>/<float:longitude>/<valid_at>")
 def skewt(latitude, longitude, valid_at):
-    valid_at_parsed = datetime.datetime.strptime(valid_at, "%Y%m%d%H")
-    valid_at_parsed = pytz.timezone('UTC').localize(valid_at_parsed)
+    with tracer.span(name="skewt") as span:
+        span.add_attribute("latitude", str(latitude))
+        span.add_attribute("longitude", str(longitude))
+        span.add_attribute("valid_at", str(valid_at))
 
-    sounding = load_weather_model_sounding(latitude, longitude, valid_at_parsed)
+        valid_at_parsed = datetime.datetime.strptime(valid_at, "%Y%m%d%H")
+        valid_at_parsed = pytz.timezone('UTC').localize(valid_at_parsed)
 
-    model_time = str(np.datetime_as_string(sounding.metadata.model_time))
-    valid_time = str(np.datetime_as_string(sounding.metadata.valid_time))
+        with tracer.span(name="sounding"):
+            sounding = load_weather_model_sounding(latitude, longitude, valid_at_parsed)
 
-    model_time_for_file_name = str(np.datetime_as_string(sounding.metadata.model_time, unit='m')).replace(":", "_")
-    valid_time_for_file_name = str(np.datetime_as_string(sounding.metadata.valid_time, unit='m')).replace(":", "_")
+        with tracer.span(name="plotting"):
+            model_time = str(np.datetime_as_string(sounding.metadata.model_time))
+            valid_time = str(np.datetime_as_string(sounding.metadata.valid_time))
 
-    full_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based")
-    full_plot_filename = f"plot_{sounding.latitude_pretty}_{sounding.longitude_pretty}_" \
-                         f"{model_time_for_file_name}_{valid_time_for_file_name}_full.png"
-    full_plot.savefig(full_plot_filename)
+            model_time_for_file_name = str(np.datetime_as_string(sounding.metadata.model_time, unit='m')).replace(":", "_")
+            valid_time_for_file_name = str(np.datetime_as_string(sounding.metadata.valid_time, unit='m')).replace(":", "_")
 
-    detail_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based", base=1000, top=500, skew=15)
-    detail_plot_filename = f"plot_{sounding.latitude_pretty}_{sounding.longitude_pretty}_" \
-                           f"{model_time_for_file_name}_{valid_time_for_file_name}_detail.png"
-    detail_plot.savefig(detail_plot_filename)
+            full_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based")
+            full_plot_filename = f"plot_{sounding.latitude_pretty}_{sounding.longitude_pretty}_" \
+                                 f"{model_time_for_file_name}_{valid_time_for_file_name}_full.png"
+            full_plot.savefig(full_plot_filename)
 
-    # Google Cloud Upload
+            detail_plot = plot_skewt_icon(sounding=sounding, parcel="surface-based", base=1000, top=500, skew=15)
+            detail_plot_filename = f"plot_{sounding.latitude_pretty}_{sounding.longitude_pretty}_" \
+                                   f"{model_time_for_file_name}_{valid_time_for_file_name}_detail.png"
+            detail_plot.savefig(detail_plot_filename)
 
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(config.bucket_name)
-    blob_full = bucket.blob(full_plot_filename)
-    blob_detail = bucket.blob(detail_plot_filename)
+        with tracer.span(name="cloud_upload"):
+            # Google Cloud Upload
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        executor.submit(blob_full.upload_from_filename, full_plot_filename)
-        executor.submit(blob_detail.upload_from_filename, detail_plot_filename)
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(config.bucket_name)
+            blob_full = bucket.blob(full_plot_filename)
+            blob_detail = bucket.blob(detail_plot_filename)
 
-    result = json.dumps(SkewTResult(model_time, valid_time,
-                                    config.bucket_public_url + full_plot_filename,
-                                    config.bucket_public_url + detail_plot_filename).__dict__)
-    response = make_response(result)
-    response.mimetype = 'application/json'
-    return response
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                executor.submit(blob_full.upload_from_filename, full_plot_filename)
+                executor.submit(blob_detail.upload_from_filename, detail_plot_filename)
+
+            result = json.dumps(SkewTResult(model_time, valid_time,
+                                            config.bucket_public_url + full_plot_filename,
+                                            config.bucket_public_url + detail_plot_filename).__dict__)
+            response = make_response(result)
+            response.mimetype = 'application/json'
+            return response
 
 
 if __name__ == "__main__":
