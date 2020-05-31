@@ -315,7 +315,7 @@ def plot_skewt_icon(sounding, parcel=None, base=1000, top=100, skew=45):
     return fig
 
 
-@app.route("/<float:latitude>/<float:longitude>/<valid_at>")
+@app.route("/<float:latitude>/<float(signed=True):longitude>/<valid_at>")
 def skewt(latitude, longitude, valid_at):
     with tracer.span(name="skewt") as span:
         span.add_attribute("latitude", str(latitude))
